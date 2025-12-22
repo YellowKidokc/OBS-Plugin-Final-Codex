@@ -29,5 +29,11 @@ chardet>=5.2.0              # Character encoding detection
 # === Data Validation ===
 pydantic>=2.5.2             # Data validation and settings management
 
+# === GUI ===
+# tkinter is built into Python, no install needed
+
 # === Optional: Async PostgreSQL (for high performance) ===
 # asyncpg>=0.29.0           # Uncomment if you need async operations
+
+# === Optional: File Watching (for real-time sync) ===
+# watchdog>=3.0.0           # Uncomment for real-time file monitoring

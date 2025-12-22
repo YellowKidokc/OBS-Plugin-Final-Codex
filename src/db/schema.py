@@ -1,5 +1,5 @@
 """
-PostgreSQL Schema for Theophysics Definition Ingest Engine
+PostgreSQL/SQLite Schema for Theophysics Definition Ingest Engine
 
 This schema supports:
 - Definition management with source attribution
@@ -8,18 +8,35 @@ This schema supports:
 - Obsidian/Markdown file ingestion
 - Equation tracking across documents
 - Usage drift detection
+- UUID management for all records
+- Both PostgreSQL and SQLite backends
 """
 
 from sqlalchemy import (
     create_engine, Column, Integer, String, Text, DateTime, Boolean,
-    ForeignKey, JSON, Enum, Float, Table, UniqueConstraint, Index
+    ForeignKey, JSON, Enum, Float, Table, UniqueConstraint, Index, event
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from datetime import datetime
 import enum
+import uuid
+
 
 Base = declarative_base()
+
+
+# === UUID HELPER ===
+
+def generate_uuid():
+    """Generate a new UUID string"""
+    return str(uuid.uuid4())
+
+
+class UUIDMixin:
+    """Mixin that adds UUID to any model"""
+    uuid = Column(String(36), unique=True, default=generate_uuid, nullable=False)
 
 
 # === ENUMS ===
@@ -78,7 +95,7 @@ definition_related = Table(
 
 # === CORE TABLES ===
 
-class IngestSession(Base):
+class IngestSession(UUIDMixin, Base):
     """Tracks each ingest operation for audit trail"""
     __tablename__ = 'ingest_sessions'
 
@@ -99,7 +116,7 @@ class IngestSession(Base):
     records = relationship("IngestRecord", back_populates="session")
 
 
-class IngestRecord(Base):
+class IngestRecord(UUIDMixin, Base):
     """Individual record from an ingest operation"""
     __tablename__ = 'ingest_records'
 
@@ -138,7 +155,7 @@ class IngestRecord(Base):
     )
 
 
-class Domain(Base):
+class Domain(UUIDMixin, Base):
     """Domains where definitions apply (physics, theology, etc.)"""
     __tablename__ = 'domains'
 
@@ -152,7 +169,7 @@ class Domain(Base):
     definitions = relationship("Definition", secondary=definition_domains, back_populates="domains")
 
 
-class Definition(Base):
+class Definition(UUIDMixin, Base):
     """Core definition table - the heart of the system"""
     __tablename__ = 'definitions'
 
@@ -218,7 +235,7 @@ class Definition(Base):
     )
 
 
-class Equation(Base):
+class Equation(UUIDMixin, Base):
     """Tracks equations and where they appear"""
     __tablename__ = 'equations'
 
@@ -244,7 +261,7 @@ class Equation(Base):
     )
 
 
-class DefinitionUsage(Base):
+class DefinitionUsage(UUIDMixin, Base):
     """Tracks where definitions are used across documents"""
     __tablename__ = 'definition_usages'
 
@@ -268,7 +285,7 @@ class DefinitionUsage(Base):
     definition = relationship("Definition", back_populates="usages")
 
 
-class DriftLog(Base):
+class DriftLog(UUIDMixin, Base):
     """Logs when a definition is used differently than canonical"""
     __tablename__ = 'drift_logs'
 
@@ -290,7 +307,7 @@ class DriftLog(Base):
     definition = relationship("Definition", back_populates="drift_logs")
 
 
-class ExcelSheet(Base):
+class ExcelSheet(UUIDMixin, Base):
     """Tracks ingested Excel sheets"""
     __tablename__ = 'excel_sheets'
 
@@ -318,7 +335,7 @@ class ExcelSheet(Base):
     )
 
 
-class HTMLTable(Base):
+class HTMLTable(UUIDMixin, Base):
     """Tracks ingested HTML tables"""
     __tablename__ = 'html_tables'
 
@@ -342,7 +359,7 @@ class HTMLTable(Base):
     )
 
 
-class ObsidianNote(Base):
+class ObsidianNote(UUIDMixin, Base):
     """Tracks ingested Obsidian/Markdown notes"""
     __tablename__ = 'obsidian_notes'
 
@@ -369,11 +386,54 @@ class ObsidianNote(Base):
     session_id = Column(Integer, ForeignKey('ingest_sessions.id'), nullable=True)
 
 
+class FileSync(UUIDMixin, Base):
+    """Tracks file sync status for scheduled scanning"""
+    __tablename__ = 'file_syncs'
+
+    id = Column(Integer, primary_key=True)
+    file_path = Column(String(1024), unique=True, nullable=False)
+    file_hash = Column(String(64), nullable=True)       # Content hash for change detection
+    file_size = Column(Integer, nullable=True)
+    last_modified = Column(DateTime, nullable=True)     # File's mtime
+    last_synced = Column(DateTime, default=datetime.utcnow)
+    sync_status = Column(String(20), default="synced")  # synced, pending, error
+    error_message = Column(Text, nullable=True)
+    needs_resync = Column(Boolean, default=False)
+
+    __table_args__ = (
+        Index('idx_file_sync_path', 'file_path'),
+        Index('idx_file_sync_status', 'sync_status'),
+    )
+
+
 # === DATABASE SETUP ===
 
-def get_engine(connection_string: str):
-    """Create database engine"""
-    return create_engine(connection_string, echo=False)
+def get_engine(connection_string: str, echo: bool = False):
+    """
+    Create database engine for PostgreSQL or SQLite.
+
+    Args:
+        connection_string: Database URL
+            - PostgreSQL: "postgresql://user:pass@localhost:5432/dbname"
+            - SQLite: "sqlite:///path/to/database.db"
+            - SQLite in-memory: "sqlite:///:memory:"
+        echo: Enable SQL logging
+
+    Returns:
+        SQLAlchemy Engine
+    """
+    # SQLite-specific settings
+    if connection_string.startswith('sqlite'):
+        from sqlalchemy.pool import StaticPool
+        return create_engine(
+            connection_string,
+            echo=echo,
+            connect_args={"check_same_thread": False},  # Allow multi-thread access
+            poolclass=StaticPool  # Single connection pool for SQLite
+        )
+
+    # PostgreSQL and other databases
+    return create_engine(connection_string, echo=echo)
 
 
 def create_all_tables(engine):
@@ -387,10 +447,27 @@ def get_session(engine):
     return Session()
 
 
+def is_sqlite(engine) -> bool:
+    """Check if the engine is SQLite"""
+    return 'sqlite' in str(engine.url)
+
+
+def is_postgresql(engine) -> bool:
+    """Check if the engine is PostgreSQL"""
+    return 'postgresql' in str(engine.url)
+
+
 # === CONVENIENCE FUNCTIONS ===
 
 def init_database(connection_string: str = "postgresql://localhost/theophysics"):
-    """Initialize the database with all tables"""
+    """
+    Initialize the database with all tables.
+
+    Supports both PostgreSQL and SQLite:
+        - PostgreSQL: "postgresql://user:pass@localhost:5432/theophysics"
+        - SQLite: "sqlite:///theophysics.db"
+        - SQLite (memory): "sqlite:///:memory:"
+    """
     engine = get_engine(connection_string)
     create_all_tables(engine)
 
@@ -410,3 +487,16 @@ def init_database(connection_string: str = "postgresql://localhost/theophysics")
     session.close()
 
     return engine
+
+
+def init_sqlite(db_path: str = "theophysics.db"):
+    """
+    Quick SQLite initialization.
+
+    Args:
+        db_path: Path to SQLite database file
+
+    Returns:
+        SQLAlchemy Engine
+    """
+    return init_database(f"sqlite:///{db_path}")
